@@ -320,3 +320,22 @@ def nvfp4_gemm_cutedsl(
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
     NVFP4Sm100Gemm.compile()(A, B, Sfa, Sfb, GlobalScale, C)
     return C
+
+
+def nvfp4_gemm_cublas(
+    A: torch.Tensor, B: torch.Tensor,
+    Sfa: torch.Tensor, Sfb: torch.Tensor,
+    Gs_A: torch.Tensor, Gs_B: torch.Tensor
+):
+    import torch.nn.functional as F
+    return F.scaled_mm(
+        A.view(torch.float4_e2m1fn_x2) if A.dtype == torch.uint8 else A,
+        B.view(torch.float4_e2m1fn_x2) if B.dtype == torch.uint8 else B,
+        scale_a=[Sfa.flatten(), Gs_A],
+        scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+        scale_b=[Sfb.flatten(), Gs_B],
+        scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+        swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+        swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+        output_dtype=torch.bfloat16,
+    )

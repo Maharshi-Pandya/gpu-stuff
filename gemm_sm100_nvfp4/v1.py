@@ -313,7 +313,7 @@ class NVFP4Sm100Gemm:
 
 
 def nvfp4_gemm_cutedsl(
-    A: torch.Tensor, B: torch.Tensor,
+    A: torch.Tensor, B: torch.Tensor,   # row major B
     Sfa: torch.Tensor, Sfb: torch.Tensor,
     GlobalScale: torch.Tensor
 ):
@@ -323,14 +323,14 @@ def nvfp4_gemm_cutedsl(
 
 
 def nvfp4_gemm_cublas(
-    A: torch.Tensor, B: torch.Tensor,
+    A: torch.Tensor, B: torch.Tensor,   # row major B
     Sfa: torch.Tensor, Sfb: torch.Tensor,
     Gs_A: torch.Tensor, Gs_B: torch.Tensor
 ):
     import torch.nn.functional as F
     return F.scaled_mm(
         A.view(torch.float4_e2m1fn_x2) if A.dtype == torch.uint8 else A,
-        B.view(torch.float4_e2m1fn_x2) if B.dtype == torch.uint8 else B,
+        B.view(torch.float4_e2m1fn_x2).T if B.dtype == torch.uint8 else B.T,
         scale_a=[Sfa.flatten(), Gs_A],
         scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
         scale_b=[Sfb.flatten(), Gs_B],

@@ -312,30 +312,47 @@ class NVFP4Sm100Gemm:
         )
 
 
+@torch.library.custom_op("fp4::nvfp4_gemm_cutedsl", mutates_args=())
 def nvfp4_gemm_cutedsl(
     A: torch.Tensor, B: torch.Tensor,   # row major B
     Sfa: torch.Tensor, Sfb: torch.Tensor,
     GlobalScale: torch.Tensor
-):
+) -> torch.Tensor:
     C = A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
     NVFP4Sm100Gemm.compile()(A, B, Sfa, Sfb, GlobalScale, C)
     return C
 
 
+@nvfp4_gemm_cutedsl.register_fake
+def _(
+    A: torch.Tensor, B: torch.Tensor,   # row major B
+    Sfa: torch.Tensor, Sfb: torch.Tensor,
+    GlobalScale: torch.Tensor
+) -> torch.Tensor:
+    return A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
+
+
+@torch.library.custom_op("fp4::nvfp4_gemm_cublas", mutates_args=())
 def nvfp4_gemm_cublas(
     A: torch.Tensor, B: torch.Tensor,   # row major B
     Sfa: torch.Tensor, Sfb: torch.Tensor,
     Gs_A: torch.Tensor, Gs_B: torch.Tensor
-):
-    import torch.nn.functional as F
-    return F.scaled_mm(
+) -> torch.Tensor:
+    return torch._scaled_mm_v2(
         A.view(torch.float4_e2m1fn_x2) if A.dtype == torch.uint8 else A,
         B.view(torch.float4_e2m1fn_x2).T if B.dtype == torch.uint8 else B.T,
-        scale_a=[Sfa.flatten(), Gs_A],
-        scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-        scale_b=[Sfb.flatten(), Gs_B],
-        scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-        swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-        output_dtype=torch.bfloat16,
+        [Sfa.flatten(), Gs_A],
+        [2, 0], [1, 0],
+        [Sfb.flatten(), Gs_B],
+        [2, 0], [1, 0],
+        None,
+        torch.bfloat16
     )
+
+@nvfp4_gemm_cublas.register_fake
+def _(
+    A: torch.Tensor, B: torch.Tensor,   # row major B
+    Sfa: torch.Tensor, Sfb: torch.Tensor,
+    Gs_A: torch.Tensor, Gs_B: torch.Tensor
+):
+    return A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)

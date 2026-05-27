@@ -5,10 +5,13 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 
+from typing import Optional
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
-from tcgen05_utils import Tcgen05, tma_bulk_g2s
 from cuda.bindings.driver import CUstream
+
+from tcgen05_utils import Tcgen05, tma_bulk_g2s
+from tracer import TraceContext
 
 from functools import cache
 
@@ -72,7 +75,8 @@ class NVFP4Sm100Gemm:
         mSfb: cute.Tensor,  # Layout: [N/128, K/16/4, 32, 4, 4]
         mGlobalScale: cute.Tensor,   # 1x fp32
         mC: cute.Tensor,
-        stream: CUstream
+        stream: CUstream,
+        trace_ptr: Optional[cutlass.Int64] = None
     ):
         A_args = self.setup_AB(mA, self.BM, self.BK // 2)
         B_args = self.setup_AB(mB, self.BN, self.BK // 2)
@@ -83,7 +87,7 @@ class NVFP4Sm100Gemm:
         grid = (cute.ceil_div(M, self.BM), cute.ceil_div(N, self.BN), 1)
         self.kernel(
             A_args, B_args, mSfa, mSfb, mGlobalScale, mC, self.BM, self.BN, self.BK,
-            self.sfa_size, self.sfb_size, self.stage_size,
+            self.sfa_size, self.sfb_size, self.stage_size, trace_ptr
         ).launch(
             grid=grid,
             block=(self.num_threads, 1, 1),
@@ -104,8 +108,11 @@ class NVFP4Sm100Gemm:
         BK: cutlass.Constexpr[int],
         SFA_SIZE: cutlass.Constexpr[int],
         SFB_SIZE: cutlass.Constexpr[int],
-        STAGE_SIZE: cutlass.Constexpr[int]
+        STAGE_SIZE: cutlass.Constexpr[int],
+        trace_ptr: Optional[cutlass.Int64] = None
     ):
+        tctx = TraceContext.create(trace_ptr)
+
         tid = cute.arch.thread_idx()[0]
         bidm, bidn, _ = cute.arch.block_idx()
         warp_id = cute.arch.make_warp_uniform(tid // cute.arch.WARP_SIZE)
@@ -164,7 +171,9 @@ class NVFP4Sm100Gemm:
             tstage = 0
             ephase = 1  # no consumer at start of producer
             for iter_k in cutlass.range(num_k_tiles, unroll=1):
+                tctx.b("mma_wait")
                 cute.arch.mbarrier_wait(tma_empty_mbar + tstage, ephase)
+                tctx.e("mma_wait")
 
                 mbar = tma_full_mbar + tstage
                 # cpasync copy from gmem to smem using PTX with mbar
@@ -177,12 +186,14 @@ class NVFP4Sm100Gemm:
                 gsfa_ptr = mSfa.iterator + (bidm * rest_k + off_k // (16 * 4)) * 512
                 gsfb_ptr = mSfb.iterator + (bidn * rest_k + off_k // (16 * 4)) * 512
 
+                tctx.b("tma_load")
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
                     tma_bulk_g2s(ssfa_ptr, gsfa_ptr, SFA_SIZE, mbar)
                     tma_bulk_g2s(ssfb_ptr, gsfb_ptr, SFB_SIZE, mbar)
                 utils.block_copy(a_tma_atom, gA_[None, iter_k], sA_[None, tstage], tma_bar_ptr=mbar)
                 utils.block_copy(b_tma_atom, gB_[None, iter_k], sB_[None, tstage], tma_bar_ptr=mbar)
+                tctx.e("tma_load")
 
                 # increase stage with wrapping
                 tstage = (tstage + 1) % self.num_stages
@@ -190,7 +201,7 @@ class NVFP4Sm100Gemm:
                     ephase ^= 1
             
         # MMA warp
-        elif warp_id == self.mma_warp:
+        if warp_id == self.mma_warp:
             tstage = 0
             fphase = 0
 
@@ -218,8 +229,10 @@ class NVFP4Sm100Gemm:
             )   # no swizzling
 
             for iter_k in cutlass.range(num_k_tiles, unroll=1):
+                tctx.b("tma_wait")
                 cute.arch.mbarrier_wait(tma_full_mbar + tstage, fphase)
                 Tcgen05.fence_after_thread_sync()
+                tctx.e("tma_wait")
 
                 ssfa_ptr = sSfa + tstage * SFA_SIZE
                 ssfb_ptr = sSfb + tstage * SFB_SIZE
@@ -235,6 +248,8 @@ class NVFP4Sm100Gemm:
                 # tcgen05.cp -> tcgen05.mma is automatically ordered implicitly
                 adesc = ab_sdesc | (sA[None, None, tstage].iterator.toint() >> 4)
                 bdesc = ab_sdesc | (sB[None, None, tstage].iterator.toint() >> 4)
+
+                tctx.b("mma")
                 with cute.arch.elect_one():
                     for k in cutlass.range_constexpr(BK // MMA_K):
                         Tcgen05.mma_nvfp4(
@@ -246,6 +261,7 @@ class NVFP4Sm100Gemm:
                         bdesc += (32 >> 4)
                     Tcgen05.commit(tma_empty_mbar + tstage)
                 
+                tctx.e("mma")
                 tstage = (tstage + 1) % self.num_stages
                 if tstage == 0:
                     fphase ^= 1
@@ -254,7 +270,7 @@ class NVFP4Sm100Gemm:
                 Tcgen05.commit(mainloop_done_mbar)
 
         # Epilogue
-        else:
+        if warp_id in self.epi_warps:
             global_scale = mGlobalScale[0]
             VECSIZE = cutlass.const_expr(16)
             # [(1, 16), (M, N // 16)]
@@ -266,11 +282,14 @@ class NVFP4Sm100Gemm:
                 num_bits_per_copy=VECSIZE * c_dtype.width,
                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE
             )
+            tctx.b("mainloop_wait")
             if warp_id == 0:
                 cute.arch.mbarrier_wait(mainloop_done_mbar, 0)
             cute.arch.barrier(barrier_id=1, number_of_threads=len(self.epi_warps) * cute.arch.WARP_SIZE)
             Tcgen05.fence_after_thread_sync()
+            tctx.e("mainloop_wait")
 
+            tctx.b("epilogue")
             for i in cutlass.range_constexpr(BN // VECSIZE):
                 # tmem bits: 16-32 lane, 0-15 column
                 addr = ((warp_id * 32) << 16) | (i * VECSIZE)
@@ -283,13 +302,16 @@ class NVFP4Sm100Gemm:
 
                 tCgC = gC[(0, None), (bidm * BM + tid, bidn * (BN // VECSIZE) + i)]
                 cute.copy(copy_atom, acc, tCgC)
+            tctx.e("epilogue")
 
             cute.arch.barrier(barrier_id=1, number_of_threads=len(self.epi_warps) * cute.arch.WARP_SIZE)
             tmem.free(tmem_ptr)
 
+        tctx.flush()
+
     @cache
     @staticmethod
-    def compile():
+    def compile(has_trace_ptr: bool = False):
         M = cute.sym_int(divisibility=128)
         N = cute.sym_int(divisibility=128)
         Kby2 = cute.sym_int(divisibility=64)
@@ -306,8 +328,10 @@ class NVFP4Sm100Gemm:
         
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         kernel = NVFP4Sm100Gemm()
+        trace_ptr = cutlass.Int64(0) if has_trace_ptr else None
         return cute.compile(
             kernel, A, B, Sfa, Sfb, GlobalScale, C, stream, 
+            trace_ptr=trace_ptr,
             options="--enable-tvm-ffi"
         )
 
@@ -327,7 +351,7 @@ def nvfp4_gemm_cutedsl(
 def _(
     A: torch.Tensor, B: torch.Tensor,   # row major B
     Sfa: torch.Tensor, Sfb: torch.Tensor,
-    GlobalScale: torch.Tensor
+    GlobalScale: torch.Tensor,
 ) -> torch.Tensor:
     return A.new_empty(A.shape[0], B.shape[0], dtype=torch.bfloat16)
 
